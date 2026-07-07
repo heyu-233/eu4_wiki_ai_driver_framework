@@ -1,0 +1,35 @@
+config/llm_config.json
+
+# Generated local indices and scraped wiki data
+data/*
+!data/.gitkeep
+wiki/
+images/
+logs/*
+!logs/.gitkeep
+
+# Python/runtime artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Local editor/agent state
+.idea/
+.codex_tools/
+.DS_Store
+
+# One-off scraped/static wiki artifacts kept only in this workspace
+all.css
+liberty.css
+liberty.js
+local_search.js
+search_index.json
+search_index_data.js
+skin=liberty.js
+skinliberty.css
+v4-shims.css
+resources/
+prototypes/
+assets/reference/
+assets/eu4-bg-loop.mp4
+fix_wiki.py
