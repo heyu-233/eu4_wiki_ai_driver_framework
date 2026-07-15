@@ -2346,11 +2346,16 @@ def resolve_entities(text: str, entity_types: tuple[str, ...] = (), limit: int =
                     rows.extend(fts_rows)
                 except sqlite3.Error:
                     pass
-        fuzzy_rows = fuzzy_entity_rows(con, text, entity_types, limit * 2)
-        if exact_rows:
-            rows.extend(fuzzy_rows)
-        else:
-            rows = fuzzy_rows + rows
+        confident_exact = any(
+            float(row["confidence"]) >= 0.9 and str(row["entity_type"]) not in {"page", "country"}
+            for row in exact_rows
+        )
+        if not confident_exact and len(rows) < limit:
+            fuzzy_rows = fuzzy_entity_rows(con, text, entity_types, limit * 2)
+            if exact_rows:
+                rows.extend(fuzzy_rows)
+            else:
+                rows = fuzzy_rows + rows
     finally:
         con.close()
 
@@ -3264,6 +3269,154 @@ def text_has_any(text: str, terms: tuple[str, ...]) -> bool:
     return any(term.lower() in lowered for term in terms)
 
 
+def infer_requested_field(text: str) -> str:
+    field_hints = (
+        ("conditions", ("\u89e6\u53d1\u6761\u4ef6", "\u5b8c\u6210\u6761\u4ef6", "\u6761\u4ef6", "\u89e6\u53d1", "\u600e\u4e48\u89e6\u53d1", "trigger", "conditions", "requirements")),
+        ("effects", ("\u6548\u679c", "\u5956\u52b1", "\u7ed9\u4ec0\u4e48", "\u83b7\u5f97\u4ec0\u4e48", "\u4fee\u6b63", "effect", "effects", "reward", "rewards")),
+        ("command", ("\u63a7\u5236\u53f0", "\u6307\u4ee4", "console", "command")),
+        ("probability", ("\u6982\u7387", "\u6743\u91cd", "\u51e0\u7387", "probability", "weight", "weights")),
+        ("overview", ("\u6709\u54ea\u4e9b", "\u54ea\u4e9b", "\u5217\u8868", "list", "overview")),
+    )
+    for field, hints in field_hints:
+        if text_has_any(text, hints):
+            return field
+    return ""
+
+
+def query_terms_for_field(field: str) -> str:
+    return {
+        "conditions": "\u89e6\u53d1\u6761\u4ef6 \u6761\u4ef6 trigger conditions requirements",
+        "effects": "\u6548\u679c \u5956\u52b1 reward effects modifier",
+        "command": "\u63a7\u5236\u53f0 \u6307\u4ee4 event command console",
+        "probability": "\u6743\u91cd \u6982\u7387 probability weight",
+        "overview": "\u5217\u8868 \u6982\u89c8 overview list",
+    }.get(field, "")
+
+
+def entity_lookup_query(entity: dict, question: str, field: str = "") -> str:
+    parts = []
+    for key in ("display_name", "canonical", "source_id", "alias"):
+        value = str(entity.get(key) or "").strip()
+        if value and value not in parts:
+            parts.append(value)
+    field_terms = query_terms_for_field(field)
+    if field_terms:
+        parts.append(field_terms)
+    parts.append(question)
+    return " ".join(parts)
+
+
+def parse_query_slots(question: str) -> list[dict]:
+    text = question.strip()
+    lowered = text.lower()
+    field = infer_requested_field(text)
+    is_achievement = "\u6210\u5c31" in text or "achievement" in lowered
+    is_mission = "\u4efb\u52a1" in text or "mission" in lowered
+    is_trait = text_has_any(text, ("\u7279\u8d28", "\u7279\u6027", "\u6743\u91cd", "\u6982\u7387", "\u7edf\u6cbb\u8005", "\u7ee7\u627f\u4eba", "trait"))
+    slots: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    def add_slot(slot: dict) -> None:
+        key = (
+            str(slot.get("kind", "")),
+            str(slot.get("source_type", "")),
+            str(slot.get("entity_id", "")) or str(slot.get("entity_name", "")),
+            str(slot.get("scope", "")),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        slots.append(slot)
+
+    # Named event questions should never be treated as generic "event/trigger" searches.
+    if text_has_any(text, ("\u4e8b\u4ef6", "\u89e6\u53d1", "\u6761\u4ef6", "\u6548\u679c", "\u9009\u9879", "event", "trigger", "condition", "effect")):
+        for entity in resolve_entities(text, ("event",), 3):
+            add_slot(
+                {
+                    "kind": "source_field",
+                    "source_type": "event",
+                    "field": field or "overview",
+                    "entity_name": str(entity.get("display_name") or entity.get("alias") or ""),
+                    "entity_id": str(entity.get("source_id") or entity.get("canonical") or ""),
+                    "page_path": str(entity.get("page_path") or ""),
+                    "query": entity_lookup_query(entity, text, field),
+                }
+            )
+            break
+
+    if is_trait:
+        for entity in resolve_entities(text, ("trait",), 3):
+            add_slot(
+                {
+                    "kind": "source_field",
+                    "source_type": "trait",
+                    "field": field or "probability",
+                    "entity_name": str(entity.get("display_name") or entity.get("alias") or ""),
+                    "entity_id": str(entity.get("source_id") or entity.get("canonical") or ""),
+                    "page_path": str(entity.get("page_path") or ""),
+                    "scope": infer_trait_scope(text),
+                    "query": entity_lookup_query(entity, text, field or "probability"),
+                }
+            )
+            break
+
+    if is_mission:
+        for scope in infer_mission_scopes(text):
+            add_slot({"kind": "mission", "field": field or "overview", "query": text, "scope": scope})
+        if not any(slot.get("kind") == "mission" for slot in slots):
+            add_slot({"kind": "mission", "field": field or "overview", "query": text, "scope": ""})
+
+    if is_achievement:
+        for query in infer_achievement_queries(text):
+            add_slot({"kind": "achievement", "field": field or "overview", "query": query})
+
+    effect_lookup_intent = text_has_any(
+        text,
+        (
+            "\u6709\u4ec0\u4e48",
+            "\u54ea\u4e9b",
+            "\u54ea\u4e2a",
+            "\u7ed9",
+            "\u83b7\u5f97",
+            "\u51cf\u5c11",
+            "\u964d\u4f4e",
+            "\u589e\u52a0",
+            "\u63d0\u9ad8",
+            "which",
+            "what",
+        ),
+    )
+    if effect_lookup_intent and not is_trait and not is_mission:
+        source_type = infer_source_type_from_text(text)
+        effect_phrase = infer_effect_phrase(text)
+        if effect_phrase != text[:120] or source_type:
+            add_slot(
+                {
+                    "kind": "effect_lookup",
+                    "source_type": source_type,
+                    "field": field or "effects",
+                    "query": effect_phrase,
+                    "scope": "",
+                }
+            )
+        entity_types = ("religion", "reform", "decision", "idea", "policy", "estate", "great_project", "modifier")
+        for entity in resolve_entities(text, entity_types, 3):
+            add_slot(
+                {
+                    "kind": "source_field",
+                    "source_type": str(entity.get("entity_type") or ""),
+                    "field": field or "effects",
+                    "entity_name": str(entity.get("display_name") or entity.get("alias") or ""),
+                    "entity_id": str(entity.get("source_id") or entity.get("canonical") or ""),
+                    "page_path": str(entity.get("page_path") or ""),
+                    "query": entity_lookup_query(entity, text, field or "effects"),
+                }
+            )
+            break
+
+    return slots
+
+
 def infer_effect_phrase(text: str) -> str:
     lowered = text.lower()
     wants_reduce = text_has_any(text, ("\u51cf\u5c11", "\u964d\u4f4e", "reduce", "lower", "decrease", "-"))
@@ -3385,7 +3538,42 @@ def infer_local_search_hints(question: str) -> dict:
     is_achievement = "\u6210\u5c31" in text or "achievement" in lowered
     is_mission = "\u4efb\u52a1" in text or "mission" in lowered
     is_trait = text_has_any(text, ("\u7279\u8d28", "\u7279\u6027", "\u8c28\u614e", "\u6743\u91cd", "\u6982\u7387", "\u9886\u8896", "\u7edf\u6cbb\u8005", "\u7ee7\u627f\u4eba", "trait"))
-    is_console_event = text_has_any(text, ("\u63a7\u5236\u53f0", "\u6307\u4ee4", "console command")) or text_has_any(text, ("\u739b\u4e3d", "\u5760\u9a6c", "mary", "horse"))
+    has_console_terms = text_has_any(text, ("\u63a7\u5236\u53f0", "\u6307\u4ee4", "console command", "command"))
+    is_console_event = has_console_terms and (
+        text_has_any(text, ("\u4e8b\u4ef6", "event"))
+        or text_has_any(text, ("\u739b\u4e3d", "\u5760\u9a6c", "mary", "horse"))
+    )
+    query_slots = parse_query_slots(text)
+    hints["query_slots"] = query_slots
+    slot_source_types = {
+        str(slot.get("source_type", ""))
+        for slot in query_slots
+        if str(slot.get("kind", "")) in {"source_field", "effect_lookup"}
+    }
+
+    for slot in query_slots:
+        kind = str(slot.get("kind", ""))
+        if kind == "achievement":
+            query = str(slot.get("query", "")).strip()
+            if query:
+                hints["achievement_queries"].append(query)
+        elif kind == "mission":
+            query = str(slot.get("query", "")).strip()
+            if query:
+                hints["mission_queries"].append({"query": query, "scope": str(slot.get("scope", "")).strip()})
+        elif kind in {"source_field", "effect_lookup"}:
+            query = str(slot.get("query", "")).strip()
+            if query:
+                hints["effect_source_queries"].append(
+                    {
+                        "effect_query": query,
+                        "source_type": normalize_source_type(str(slot.get("source_type", "")).strip()),
+                        "scope": str(slot.get("scope", "")).strip(),
+                    }
+                )
+            page_path = str(slot.get("page_path", "")).strip()
+            if page_path.endswith(".html") and query:
+                hints["page_context_queries"].append({"path_hint": page_path, "query": query})
 
     if is_achievement:
         hints["achievement_queries"].extend(infer_achievement_queries(text))
@@ -3431,7 +3619,7 @@ def infer_local_search_hints(question: str) -> dict:
             {"effect_query": effect_phrase, "source_type": source_type, "scope": ""}
         )
 
-    if effect_intent and not is_trait and not is_mission:
+    if effect_intent and not is_trait and not is_mission and not (slot_source_types & {"religion", "reform", "decision", "idea", "policy", "estate", "great_project", "modifier"}):
         entity_types = ("religion", "reform", "decision", "idea", "policy", "estate", "great_project", "modifier")
         for entity in resolve_entities(text, entity_types, 3):
             entity_type = str(entity.get("entity_type") or "")
@@ -3464,7 +3652,7 @@ def infer_local_search_hints(question: str) -> dict:
             "effect",
         ),
     )
-    if event_detail_intent and not is_mission and not is_trait:
+    if event_detail_intent and not is_mission and not is_trait and "event" not in slot_source_types:
         for entity in resolve_entities(text, ("event",), 3):
             entity_query = " ".join(
                 part
