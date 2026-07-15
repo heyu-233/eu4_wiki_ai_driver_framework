@@ -2609,6 +2609,10 @@ def search_effect_sources(
             details.append("持续：" + row["duration"])
         if row["scope"]:
             details.append("范围：" + row["scope"])
+        if row["source_type"] == "event" and row["raw_text"]:
+            raw_text = str(row["raw_text"] or "")
+            if "触发条件" in raw_text or "trigger" in raw_text.lower():
+                details.insert(0, raw_text)
         results.append(
             {
                 "title": title,
@@ -3444,6 +3448,41 @@ def infer_local_search_hints(question: str) -> dict:
             hints["effect_source_queries"].append(
                 {"effect_query": entity_query, "source_type": entity_type, "scope": ""}
             )
+            break
+
+    event_detail_intent = text_has_any(
+        text,
+        (
+            "\u4e8b\u4ef6",
+            "\u89e6\u53d1",
+            "\u6761\u4ef6",
+            "\u6548\u679c",
+            "\u9009\u9879",
+            "event",
+            "trigger",
+            "condition",
+            "effect",
+        ),
+    )
+    if event_detail_intent and not is_mission and not is_trait:
+        for entity in resolve_entities(text, ("event",), 3):
+            entity_query = " ".join(
+                part
+                for part in (
+                    str(entity.get("display_name") or ""),
+                    str(entity.get("canonical") or ""),
+                    str(entity.get("source_id") or ""),
+                    str(entity.get("alias") or ""),
+                    text,
+                )
+                if part
+            )
+            hints["effect_source_queries"].append(
+                {"effect_query": entity_query, "source_type": "event", "scope": ""}
+            )
+            path_hint = str(entity.get("page_path") or "")
+            if path_hint.endswith(".html"):
+                hints["page_context_queries"].append({"path_hint": path_hint, "query": entity_query})
             break
 
     if is_console_event:
